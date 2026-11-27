@@ -10,9 +10,10 @@ from ultralytics.utils.checks import check_yaml
 
 from .bot_sort import BOTSORT
 from .byte_tracker import BYTETracker
+from .track_tracker import TRACKTRACK
 
 # A mapping of tracker types to corresponding tracker classes
-TRACKER_MAP = {"bytetrack": BYTETracker, "botsort": BOTSORT}
+TRACKER_MAP = {"bytetrack": BYTETracker, "botsort": BOTSORT, "tracktrack": TRACKTRACK}
 
 
 def on_predict_start(predictor: object, persist: bool = False) -> None:
@@ -40,8 +41,11 @@ def on_predict_start(predictor: object, persist: bool = False) -> None:
     tracker = check_yaml(predictor.args.tracker)
     cfg = IterableSimpleNamespace(**yaml_load(tracker))
 
-    if cfg.tracker_type not in {"bytetrack", "botsort"}:
-        raise AssertionError(f"Only 'bytetrack' and 'botsort' are supported for now, but got '{cfg.tracker_type}'")
+    if cfg.tracker_type not in TRACKER_MAP:
+        raise AssertionError(f"Supported trackers are {sorted(TRACKER_MAP)}, but got '{cfg.tracker_type}'")
+    if cfg.tracker_type != "tracktrack" and hasattr(predictor, "_tracktrack_orig_postprocess"):
+        predictor.postprocess = predictor._tracktrack_orig_postprocess
+        del predictor._tracktrack_orig_postprocess
 
     trackers = []
     for _ in range(predictor.dataset.bs):
@@ -51,6 +55,8 @@ def on_predict_start(predictor: object, persist: bool = False) -> None:
             break
     predictor.trackers = trackers
     predictor.vid_path = [None] * predictor.dataset.bs  # for determining when to reset tracker on new video
+    if hasattr(TRACKER_MAP[cfg.tracker_type], "setup_predictor"):
+        TRACKER_MAP[cfg.tracker_type].setup_predictor(predictor)
 
 
 def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None:
@@ -76,9 +82,12 @@ def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None
             predictor.vid_path[i if is_stream else 0] = vid_path
 
         det = (result.obb if is_obb else result.boxes).cpu().numpy()
-        if len(det) == 0:
-            continue
-        tracks = tracker.update(det, result.orig_img)
+        kwargs = {}
+        if hasattr(result, "_tracktrack_loose"):
+            from .track_tracker import extract_loose_detections
+
+            kwargs["dets_del"] = extract_loose_detections(result)
+        tracks = tracker.update(det, result.orig_img, **kwargs)
         if len(tracks) == 0:
             continue
         idx = tracks[:, -1].astype(int)

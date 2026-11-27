@@ -1,0 +1,22 @@
+# TrackTrack adapted to single tiny-UAV tracking while preserving the standard
+# BoT-SORT confidence pools and Strong Baseline output policy.
+tracker_type: tracktrack
+
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.25
+track_buffer: 30
+match_thresh: 0.8
+
+conf_weight: 0.1
+angle_weight: 0.05
+penalty_p: 0.0
+penalty_q: 0.2
+reduce_step: 0.05
+tai_thr: 0.55
+min_track_len: 1
+
+gmc_method: sparseOptFlow
+with_reid: false
+
+min_box_area: 10

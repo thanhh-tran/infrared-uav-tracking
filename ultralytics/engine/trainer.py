@@ -221,9 +221,10 @@ class BaseTrainer:
         self.device = torch.device("cuda", RANK)
         # LOGGER.info(f'DDP info: RANK {RANK}, WORLD_SIZE {world_size}, DEVICE {self.device}')
         os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"  # set to enforce timeout
+        ddp_timeout = int(os.getenv("ULTRALYTICS_DDP_TIMEOUT_SECONDS", "600"))
         dist.init_process_group(
             backend="nccl" if dist.is_nccl_available() else "gloo",
-            timeout=timedelta(seconds=10800),  # 3 hours
+            timeout=timedelta(seconds=ddp_timeout),
             rank=RANK,
             world_size=world_size,
         )
@@ -285,17 +286,21 @@ class BaseTrainer:
         # Dataloaders
         batch_size = self.batch_size // max(world_size, 1)
         self.train_loader = self.get_dataloader(self.trainset, batch_size=batch_size, rank=LOCAL_RANK, mode="train")
+        # Build one validation shard per DDP rank. Metrics are gathered by the validator.
+        self.test_loader = self.get_dataloader(
+            self.testset,
+            batch_size=batch_size if self.args.task == "obb" else batch_size * 2,
+            rank=LOCAL_RANK if world_size > 1 else -1,
+            mode="val",
+        )
+        self.validator = self.get_validator()
         if RANK in {-1, 0}:
-            # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
-            self.test_loader = self.get_dataloader(
-                self.testset, batch_size=batch_size if self.args.task == "obb" else batch_size * 2, rank=-1, mode="val"
-            )
-            self.validator = self.get_validator()
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
-            self.ema = ModelEMA(self.model)
             if self.args.plots:
                 self.plot_training_labels()
+        # Each rank maintains an identical EMA so validation can use all GPUs without DDP forward collectives.
+        self.ema = ModelEMA(self.model)
 
         # Optimizer
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
@@ -323,6 +328,8 @@ class BaseTrainer:
         self._setup_train(world_size)
 
         nb = len(self.train_loader)  # number of batches
+        if self.args.max_train_batches > 0:
+            nb = min(nb, self.args.max_train_batches)
         nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
         last_opt_step = -1
         self.epoch_time = None
@@ -358,9 +365,12 @@ class BaseTrainer:
 
             if RANK in {-1, 0}:
                 LOGGER.info(self.progress_string())
-                pbar = TQDM(enumerate(self.train_loader), total=nb)
+                pbar = TQDM(enumerate(self.train_loader), total=nb, disable=not self.args.verbose)
             self.tloss = None
             for i, batch in pbar:
+                if i >= nb:
+                    break
+                self.batch_i = i
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
                 ni = i + nb * epoch
@@ -428,9 +438,14 @@ class BaseTrainer:
                 final_epoch = epoch + 1 >= self.epochs
                 self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
-                # Validation
-                if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
-                    self.metrics, self.fitness = self.validate()
+            final_epoch = epoch + 1 >= self.epochs
+            # Every DDP rank validates its own shard; rank 0 gathers statistics and computes global metrics.
+            if self.args.val or final_epoch or (RANK in {-1, 0} and (self.stopper.possible_stop or self.stop)):
+                rank_metrics, rank_fitness = self.validate()
+                if RANK in {-1, 0}:
+                    self.metrics, self.fitness = rank_metrics, rank_fitness
+
+            if RANK in {-1, 0}:
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
@@ -468,7 +483,10 @@ class BaseTrainer:
             # Do final val with best.pt
             seconds = time.time() - self.train_time_start
             LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
-            self.final_eval()
+            if world_size == 1:
+                self.final_eval()
+            else:
+                LOGGER.info("Skipping redundant single-rank final validation; distributed epoch validation is complete.")
             if self.args.plots:
                 self.plot_metrics()
             self.run_callbacks("on_train_end")
@@ -785,7 +803,8 @@ class BaseTrainer:
         Returns:
             (torch.optim.Optimizer): The constructed optimizer.
         """
-        g = [], [], []  # optimizer parameter groups
+        g = [], [], []  # regular optimizer parameter groups: decay, norm, bias
+        aa_g = [], [], []  # optional AA-head groups with a separate learning rate
         bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
         if name == "auto":
             LOGGER.info(
@@ -800,13 +819,19 @@ class BaseTrainer:
 
         for module_name, module in model.named_modules():
             for param_name, param in module.named_parameters(recurse=False):
+                if not param.requires_grad:
+                    continue
                 fullname = f"{module_name}.{param_name}" if module_name else param_name
+                groups = aa_g if ".aa_filters." in fullname and self.args.aa_lr > 0 else g
                 if "bias" in fullname:  # bias (no decay)
-                    g[2].append(param)
+                    groups[2].append(param)
                 elif isinstance(module, bn):  # weight (no decay)
-                    g[1].append(param)
+                    groups[1].append(param)
                 else:  # weight (with decay)
-                    g[0].append(param)
+                    groups[0].append(param)
+
+        if self.args.aa_lr > 0 and not any(aa_g):
+            raise ValueError("aa_lr requires a model with trainable parameters under an aa_filters module")
 
         optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "auto"}
         name = {x.lower(): x for x in optimizers}.get(name.lower())
@@ -824,8 +849,17 @@ class BaseTrainer:
 
         optimizer.add_param_group({"params": g[0], "weight_decay": decay})  # add g0 with weight_decay
         optimizer.add_param_group({"params": g[1], "weight_decay": 0.0})  # add g1 (BatchNorm2d weights)
+        if self.args.aa_lr > 0:
+            optimizer.add_param_group({"params": aa_g[2], "lr": self.args.aa_lr, "weight_decay": 0.0})
+            optimizer.add_param_group({"params": aa_g[0], "lr": self.args.aa_lr, "weight_decay": decay})
+            optimizer.add_param_group({"params": aa_g[1], "lr": self.args.aa_lr, "weight_decay": 0.0})
         LOGGER.info(
             f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups "
             f"{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias(decay=0.0)"
         )
+        if self.args.aa_lr > 0:
+            LOGGER.info(
+                f"AA optimizer groups: lr={self.args.aa_lr}, {len(aa_g[1])} norm, "
+                f"{len(aa_g[0])} weight, {len(aa_g[2])} bias tensors"
+            )
         return optimizer

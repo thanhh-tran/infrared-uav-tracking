@@ -314,6 +314,7 @@ class Compose:
         """
         return f"{self.__class__.__name__}({', '.join([f'{t}' for t in self.transforms])})"
 
+
 # 在augment.py的Compose类之后添加以下实现（约在文件第20行附近）
 # 在 ultralytics/data/augment.py 中修改 ThermalNoise 类
 class ThermalNoise:
@@ -1424,6 +1425,27 @@ class RandomHSV:
         return labels
 
 
+class IRSinusoidal:
+    """IR-guided intensity augmentation from Ustun et al., CVPRW 2025."""
+
+    def __init__(self, p=0.0) -> None:
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f"IRSinusoidal probability must be in [0, 1], got {p}")
+        self.p = p
+
+    def __call__(self, labels):
+        """Apply y=(sin(2*pi*x+theta)+1)/2 with one random phase per image."""
+        if self.p and random.random() < self.p:
+            image = labels["img"]
+            if image.dtype != np.uint8:
+                raise TypeError(f"IRSinusoidal expects uint8 input, got {image.dtype}")
+            theta = np.random.uniform(0.0, 2.0 * np.pi)
+            values = np.arange(256, dtype=np.float32) / 255.0
+            lookup = np.rint((np.sin(2.0 * np.pi * values + theta) + 1.0) * 127.5).astype(np.uint8)
+            labels["img"] = cv2.LUT(image, lookup)
+        return labels
+
+
 class RandomFlip:
     """
     Applies a random horizontal or vertical flip to an image with a given probability.
@@ -2379,6 +2401,7 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
             pre_transform,
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             Albumentations(p=1.0),
+            IRSinusoidal(p=hyp.ir_sine_p),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),

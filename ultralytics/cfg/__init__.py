@@ -153,12 +153,14 @@ CFG_FLOAT_KEYS = frozenset(
         "warmup_epochs",
         "box",
         "cls",
+        "aa",
         "dfl",
         "degrees",
         "shear",
         "time",
         "workspace",
         "batch",
+        "aa_lr",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -173,6 +175,7 @@ CFG_FRACTION_KEYS = frozenset(
         "hsv_h",
         "hsv_s",
         "hsv_v",
+        "ir_sine_p",
         "translate",
         "scale",
         "perspective",

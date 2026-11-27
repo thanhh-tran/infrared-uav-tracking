@@ -25,6 +25,7 @@ from ultralytics.nn.modules import (
     A2C2f,
     AConv,
     ADown,
+    AnomalyDetect,
     Bottleneck,
     BottleneckCSP,
     C2f,
@@ -271,11 +272,24 @@ class BaseModel(torch.nn.Module):
             verbose (bool, optional): Whether to log the transfer progress. Defaults to True.
         """
         model = weights["model"] if isinstance(weights, dict) else weights  # torchvision models are not dicts
-        csd = model.float().state_dict()  # checkpoint state_dict as FP32
-        csd = intersect_dicts(csd, self.state_dict())  # intersect
+        source_model = model.float()
+        csd = source_model.state_dict()  # checkpoint state_dict as FP32
+        target_head = self.model[-1]
+        source_head = source_model.model[-1] if hasattr(source_model, "model") else None
+        exclude = []
+        if isinstance(target_head, AnomalyDetect) and not isinstance(source_head, AnomalyDetect):
+            # Preserve the baseline class head and initialize only the new parallel
+            # AA objectness/statistical modules from scratch.
+            head_index = len(self.model) - 1
+            exclude = [f"model.{head_index}.aa_filters.", f"model.{head_index}.anomaly_tests."]
+        csd = intersect_dicts(csd, self.state_dict(), exclude=exclude)  # intersect
         self.load_state_dict(csd, strict=False)  # load
         if verbose:
             LOGGER.info(f"Transferred {len(csd)}/{len(self.model.state_dict())} items from pretrained weights")
+            if exclude:
+                LOGGER.info(
+                    "Initialized parallel AA objectness modules from scratch; transferred backbone, neck, class and DFL box heads"
+                )
 
     def loss(self, batch, preds=None):
         """
@@ -335,6 +349,8 @@ class DetectionModel(BaseModel):
             m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
             self.stride = m.stride
             m.bias_init()  # only run once
+            if isinstance(m, AnomalyDetect):
+                m.reset_anomaly_statistics()  # stride probing is not a real training batch
         else:
             self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
 
@@ -1050,11 +1066,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in frozenset({Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}):
+        elif m in frozenset({Detect, AnomalyDetect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}):
             args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, Segment, Pose, OBB}:
+            if m in {Detect, AnomalyDetect, Segment, Pose, OBB}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])

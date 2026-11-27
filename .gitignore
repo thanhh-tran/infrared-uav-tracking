@@ -1,0 +1,15 @@
+.venv/
+runs/
+datasets/
+sbatch/
+pretrain/
+pretrained/
+tools/
+logs/
+tests/
+*.pt
+*.py[cod]
+__pycache__/
+*.cache
+.pytest_cache/
+.DS_Store

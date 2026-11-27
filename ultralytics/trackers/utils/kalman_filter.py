@@ -422,7 +422,6 @@ class KalmanFilterXYWH(KalmanFilterXYAH):
             self._std_weight_position * mean[3],
         ]
         innovation_cov = np.diag(np.square(std))
-
         mean = np.dot(self._update_mat, mean)
         covariance = np.linalg.multi_dot((self._update_mat, covariance, self._update_mat.T))
         return mean, covariance + innovation_cov
@@ -489,3 +488,32 @@ class KalmanFilterXYWH(KalmanFilterXYAH):
             >>> new_mean, new_covariance = kf.update(mean, covariance, measurement)
         """
         return super().update(mean, covariance, measurement)
+
+
+class NSAKalmanFilterXYWH(KalmanFilterXYWH):
+    """TrackTrack-only NSA Kalman filter with confidence-scaled measurement noise."""
+
+    def project(self, mean, covariance, confidence=None) -> tuple:
+        std = [
+            self._std_weight_position * mean[2],
+            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[2],
+            self._std_weight_position * mean[3],
+        ]
+        innovation_cov = np.diag(np.square(std))
+        if confidence is not None:
+            innovation_cov *= max(1.0 - float(confidence), 0.05)
+        projected_mean = np.dot(self._update_mat, mean)
+        projected_covariance = np.linalg.multi_dot((self._update_mat, covariance, self._update_mat.T))
+        return projected_mean, projected_covariance + innovation_cov
+
+    def update(self, mean, covariance, measurement, confidence=None) -> tuple:
+        projected_mean, projected_cov = self.project(mean, covariance, confidence)
+        chol_factor, lower = scipy.linalg.cho_factor(projected_cov, lower=True, check_finite=False)
+        kalman_gain = scipy.linalg.cho_solve(
+            (chol_factor, lower), np.dot(covariance, self._update_mat.T).T, check_finite=False
+        ).T
+        innovation = measurement - projected_mean
+        new_mean = mean + np.dot(innovation, kalman_gain.T)
+        new_covariance = covariance - np.linalg.multi_dot((kalman_gain, projected_cov, kalman_gain.T))
+        return new_mean, new_covariance

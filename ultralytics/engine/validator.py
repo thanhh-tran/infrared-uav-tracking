@@ -29,11 +29,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch import distributed as dist
 
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.autobackend import AutoBackend
-from ultralytics.utils import LOGGER, TQDM, callbacks, colorstr, emojis
+from ultralytics.utils import LOGGER, RANK, TQDM, callbacks, colorstr, emojis
 from ultralytics.utils.checks import check_imgsz
 from ultralytics.utils.ops import Profile
 from ultralytics.utils.torch_utils import de_parallel, select_device, smart_inference_mode
@@ -167,10 +168,22 @@ class BaseValidator:
             Profile(device=self.device),
             Profile(device=self.device),
         )
-        bar = TQDM(self.dataloader, desc=self.get_desc(), total=len(self.dataloader))
+        max_val_batches = (
+            min(len(self.dataloader), self.args.max_val_batches)
+            if self.args.max_val_batches > 0
+            else len(self.dataloader)
+        )
+        bar = TQDM(
+            self.dataloader,
+            desc=self.get_desc() if RANK in {-1, 0} else None,
+            total=max_val_batches,
+            disable=RANK not in {-1, 0} or not self.args.verbose,
+        )
         self.init_metrics(de_parallel(model))
         self.jdict = []  # empty before each val
         for batch_i, batch in enumerate(bar):
+            if batch_i >= max_val_batches:
+                break
             self.run_callbacks("on_val_batch_start")
             self.batch_i = batch_i
             # Preprocess
@@ -196,15 +209,79 @@ class BaseValidator:
                 self.plot_predictions(batch, preds, batch_i)
 
             self.run_callbacks("on_val_batch_end")
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        if world_size > 1:
+            if RANK == 0:
+                LOGGER.info(f"Distributed validation: gathering metrics from {world_size} ranks...")
+            # Keep distributed metric transport tensor-only. Object collectives pickle CPU
+            # tensors and route them through NCCL, which is slow and has caused native
+            # crashes with some PyTorch/NCCL combinations.
+            gathered_stats = {} if RANK == 0 else None
+            for key, values in self.stats.items():
+                if values:
+                    local = torch.cat(values, 0).to(self.device)
+                else:
+                    shape = (0, self.niou) if key == "tp" else (0,)
+                    dtype = torch.bool if key == "tp" else torch.float32
+                    local = torch.empty(shape, device=self.device, dtype=dtype)
+
+                original_dtype = local.dtype
+                if original_dtype == torch.bool:
+                    local = local.to(torch.uint8)
+
+                local_size = torch.tensor([local.shape[0]], device=self.device, dtype=torch.long)
+                rank_sizes = [torch.zeros_like(local_size) for _ in range(world_size)]
+                dist.all_gather(rank_sizes, local_size)
+                sizes = [int(size.item()) for size in rank_sizes]
+                padded_size = max(max(sizes), 1)
+                if local.shape[0] < padded_size:
+                    padding = torch.zeros(
+                        (padded_size - local.shape[0], *local.shape[1:]),
+                        device=self.device,
+                        dtype=local.dtype,
+                    )
+                    local = torch.cat((local, padding), 0)
+
+                gathered = [torch.empty_like(local) for _ in range(world_size)]
+                dist.all_gather(gathered, local.contiguous())
+                if RANK == 0:
+                    parts = [tensor[:size].cpu() for tensor, size in zip(gathered, sizes)]
+                    if original_dtype == torch.bool:
+                        parts = [part.bool() for part in parts]
+                    gathered_stats[key] = parts
+
+            dist.reduce(self.loss, dst=0, op=dist.ReduceOp.SUM)
+            seen = torch.tensor(self.seen, device=self.device, dtype=torch.long)
+            dist.reduce(seen, dst=0, op=dist.ReduceOp.SUM)
+            batch_count = torch.tensor(max_val_batches, device=self.device, dtype=torch.long)
+            dist.reduce(batch_count, dst=0, op=dist.ReduceOp.SUM)
+            for profile in dt:
+                elapsed = torch.tensor(profile.t, device=self.device, dtype=torch.float64)
+                dist.reduce(elapsed, dst=0, op=dist.ReduceOp.SUM)
+                if RANK == 0:
+                    profile.t = elapsed.item()
+            if RANK != 0:
+                model.float()
+                return {"fitness": 0.0}
+            self.seen = int(seen.item())
+            global_val_batches = int(batch_count.item())
+            self.stats = gathered_stats
+            LOGGER.info(f"Distributed validation gather complete: {self.seen} images.")
+        else:
+            global_val_batches = max_val_batches
+
         stats = self.get_stats()
         self.check_stats(stats)
-        self.speed = dict(zip(self.speed.keys(), (x.t / len(self.dataloader.dataset) * 1e3 for x in dt)))
+        self.speed = dict(zip(self.speed.keys(), (x.t / max(self.seen, 1) * 1e3 for x in dt)))
         self.finalize_metrics()
         self.print_results()
         self.run_callbacks("on_val_end")
         if self.training:
             model.float()
-            results = {**stats, **trainer.label_loss_items(self.loss.cpu() / len(self.dataloader), prefix="val")}
+            results = {
+                **stats,
+                **trainer.label_loss_items(self.loss.cpu() / global_val_batches, prefix="val"),
+            }
             return {k: round(float(v), 5) for k, v in results.items()}  # return results as 5 decimal place floats
         else:
             LOGGER.info(

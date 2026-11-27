@@ -333,7 +333,7 @@ class GMC:
         keypoints = cv2.goodFeaturesToTrack(frame, mask=None, **self.feature_params)
 
         # Handle first frame
-        if not self.initializedFirstFrame or self.prevKeyPoints is None:
+        if not self.initializedFirstFrame or self.prevKeyPoints is None or keypoints is None:
             self.prevFrame = frame.copy()
             self.prevKeyPoints = copy.copy(keypoints)
             self.initializedFirstFrame = True
@@ -341,13 +341,18 @@ class GMC:
 
         # Find correspondences
         matchedKeypoints, status, _ = cv2.calcOpticalFlowPyrLK(self.prevFrame, frame, self.prevKeyPoints, None)
+        if matchedKeypoints is None or status is None:
+            self.prevFrame = frame.copy()
+            self.prevKeyPoints = copy.copy(keypoints)
+            LOGGER.warning("WARNING: sparse optical flow failed; using identity camera motion")
+            return H
 
         # Leave good correspondences only
         prevPoints = []
         currPoints = []
 
         for i in range(len(status)):
-            if status[i]:
+            if status[i, 0]:
                 prevPoints.append(self.prevKeyPoints[i])
                 currPoints.append(matchedKeypoints[i])
 
@@ -355,8 +360,10 @@ class GMC:
         currPoints = np.array(currPoints)
 
         # Find rigid matrix
-        if (prevPoints.shape[0] > 4) and (prevPoints.shape[0] == prevPoints.shape[0]):
-            H, _ = cv2.estimateAffinePartial2D(prevPoints, currPoints, cv2.RANSAC)
+        if prevPoints.shape[0] > 4 and prevPoints.shape[0] == currPoints.shape[0]:
+            estimated, _ = cv2.estimateAffinePartial2D(prevPoints, currPoints, cv2.RANSAC)
+            if estimated is not None and np.isfinite(estimated).all():
+                H = estimated
 
             if self.downscale > 1.0:
                 H[0, 2] *= self.downscale

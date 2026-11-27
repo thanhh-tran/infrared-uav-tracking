@@ -1,6 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import math
+import os
 import random
 from copy import copy
 
@@ -48,8 +49,16 @@ class DetectionTrainer(BaseTrainer):
         if getattr(dataset, "rect", False) and shuffle:
             LOGGER.warning("WARNING ⚠️ 'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
             shuffle = False
-        workers = self.args.workers if mode == "train" else self.args.workers * 2
-        return build_dataloader(dataset, batch_size, workers, shuffle, rank)  # return dataloader
+        world_size = max(int(os.getenv("WORLD_SIZE", "1")), 1)
+        # Keep the total validation workers within the Slurm/host allocation.
+        workers = (
+            self.args.workers
+            if mode == "train" or self.args.workers == 0
+            else max(self.args.workers // world_size, 1)
+        )
+        return build_dataloader(
+            dataset, batch_size, workers, shuffle, rank, infinite=mode == "train"
+        )  # return dataloader
 
     def preprocess_batch(self, batch):
         """Preprocesses a batch of images by scaling and converting to float."""
@@ -89,7 +98,12 @@ class DetectionTrainer(BaseTrainer):
 
     def get_validator(self):
         """Returns a DetectionValidator for YOLO model validation."""
-        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        head = de_parallel(self.model).model[-1]
+        self.loss_names = (
+            ("box_loss", "cls_loss", "aa_loss", "dfl_loss")
+            if getattr(head, "has_anomaly_objectness", False)
+            else ("box_loss", "cls_loss", "dfl_loss")
+        )
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )

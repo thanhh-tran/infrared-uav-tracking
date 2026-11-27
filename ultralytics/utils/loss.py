@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
@@ -36,27 +37,6 @@ class VarifocalLoss(nn.Module):
             )
         return loss
 
-class NWDLoss(nn.Module):
-    """Normalized Wasserstein Distance Loss for small objects"""
-    def __init__(self, eps=1e-7):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, pred, target):
-        # 将预测和目标转为高斯分布参数
-        pred_mean, pred_sigma = pred.chunk(2, dim=-1)
-        target_mean, target_sigma = target.chunk(2, dim=-1)
-        
-        # 计算Wasserstein距离^2
-        mean_distance = torch.sum((pred_mean - target_mean)**2, dim=-1)
-        sigma_distance = torch.sum((pred_sigma - target_sigma)**2, dim=-1)
-        w_dist = mean_distance + sigma_distance
-        
-        # 归一化处理
-        norm_factor = 5.0 * (target_sigma.mean(dim=-1) + self.eps)
-        nwd = 1.0 - torch.exp(-w_dist.sqrt() / norm_factor)
-        return nwd.mean()
-
 class FocalLoss(nn.Module):
     """Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)."""
 
@@ -80,53 +60,6 @@ class FocalLoss(nn.Module):
             alpha_factor = label * alpha + (1 - label) * (1 - alpha)
             loss *= alpha_factor
         return loss.mean(1).sum()
-
-# class FocalLoss(nn.Module):
-#     """Wraps focal loss around existing loss_fcn() with dynamic gamma scaling."""
-
-#     def __init__(self, gamma_scale=0.3):
-#         """Initializer for FocalLoss with dynamic gamma scaling
-#         Args:
-#             gamma_scale (float): scaling factor for area-based gamma adjustment, range 0-1
-#         """
-#         super().__init__()
-#         self.gamma_scale = gamma_scale  # 动态gamma缩放系数
-
-#     @staticmethod
-#     def forward(pred, label, gamma=1.5, alpha=0.25, area=None):
-#         """Calculates focal loss with dynamic gamma adjustment
-#         Args:
-#             pred (tensor): model predictions, shape [BS, num_anchors, num_classes]
-#             label (tensor): target labels, shape [BS, num_anchors, num_classes]
-#             gamma (float): base focal factor
-#             alpha (float): focal alpha
-#             area (tensor): target area for dynamic scaling, shape [BS, num_anchors]
-#         """
-#         # 动态gamma调整（仅当提供area时生效）
-#         if area is not None:
-#             # 保持gamma的原始计算图
-#             base_gamma = gamma
-            
-#             # 确保area形状匹配 [BS, num_anchors] -> [BS, num_anchors, 1]
-#             area = area.unsqueeze(-1) + 1e-3  # 防止零面积
-            
-#             # 计算动态gamma：gamma = base_gamma * (1 + γ_scale * sqrt(area))
-#             gamma = base_gamma * (1.0 + F.relu(self.gamma_scale) * torch.sqrt(area))
-
-#         # 标准Focal计算流程
-#         pred_prob = pred.sigmoid()  # 从logits得到概率
-#         p_t = label * pred_prob + (1 - label) * (1 - pred_prob)
-#         modulating_factor = (1.0 - p_t) ** gamma
-
-#         loss = F.binary_cross_entropy_with_logits(pred, label, reduction="none")
-#         loss *= modulating_factor
-
-#         if alpha > 0:
-#             alpha_factor = label * alpha + (1 - label) * (1 - alpha)
-#             loss *= alpha_factor
-
-#         return loss.mean(1).sum()  # 按类别维度求平均后求和
-
 
 class DFLoss(nn.Module):
     """Criterion class for computing DFL losses during training."""
@@ -154,89 +87,39 @@ class DFLoss(nn.Module):
         ).mean(-1, keepdim=True)
         
 class BboxLoss(nn.Module):
-    def __init__(self, reg_max=16, use_dfl=True, alpha=2.5, ratio_power=1.2, gamma_scale=0.3):
+    """Standard YOLO CIoU box loss plus Distribution Focal Loss."""
+
+    def __init__(self, reg_max=16):
         super().__init__()
         self.reg_max = reg_max
-        self.use_dfl = use_dfl
-        self.alpha = alpha
-        self.ratio_power = ratio_power
-        self.gamma_scale = gamma_scale
-        
-        # Keep DFL logic
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
 
-    def wasserstein_distance(self, mu1, mu2, sigma1, sigma2):
-        """Improved Wasserstein distance calculation with shape weighting"""
-        center_distance = torch.sum(torch.pow(mu1 - mu2, 2), dim=1)
-        wh_distance = torch.sum(torch.pow(sigma1 - sigma2, 2), dim=1)
-        return center_distance + 0.8 * wh_distance  # Balance position and size sensitivity
+    def forward(
+        self,
+        pred_dist,
+        pred_bboxes,
+        anchor_points,
+        target_bboxes,
+        target_scores,
+        target_scores_sum,
+        fg_mask,
+    ):
+        """Compute CIoU and DFL while keeping the regression graph on empty DDP ranks."""
+        zero = pred_dist.sum() * 0.0
+        if not fg_mask.sum():
+            return zero, zero
 
-    def shape_aware_penalty(self, pred_wh, target_wh, eps=1e-7):
-        """Comprehensive shape penalty term (incorporating Shape-IoU logic)"""
-        # Aspect ratio weight normalization
-        w_pow = torch.pow(target_wh[..., 0], self.ratio_power)
-        h_pow = torch.pow(target_wh[..., 1], self.ratio_power)
-        ww = 2 * w_pow / (w_pow + h_pow + eps)
-        hh = 2 * h_pow / (w_pow + h_pow + eps)
-        
-        # Shape difference penalty
-        omiga_w = torch.abs(pred_wh[..., 0] - target_wh[..., 0]) / (
-            torch.max(pred_wh[..., 0], target_wh[..., 0]) + eps)
-        omiga_h = torch.abs(pred_wh[..., 1] - target_wh[..., 1]) / (
-            torch.max(pred_wh[..., 1], target_wh[..., 1]) + eps)
-        
-        omiga_w = torch.clamp(omiga_w, max=5.0)
-        omiga_h = torch.clamp(omiga_h, max=5.0)
-        
-        # Weighted penalty term
-        return (ww * omiga_w.pow(2) + hh * omiga_h.pow(2)) * self.gamma_scale
+        weights = target_scores.sum(-1)[fg_mask]
+        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True).squeeze(-1)
+        loss_box = ((1.0 - iou) * weights).sum() / target_scores_sum
 
-    def dynamic_wiou(self, iou, beta=None):
-        """Improved dynamic α*-WIoU v3"""
-        if beta is None:
-            beta = (1 - iou).detach() / (1 - iou.mean().detach() + 1e-7)
-        r = beta / (self.alpha** (beta - 1 + 1e-3))  # Prevent alpha^0=1 case
-        return r * (1 - iou) ** self.alpha
-
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, 
-                target_scores, target_scores_sum, fg_mask, epoch_ratio=0.0):
-        # Initialize loss terms
-        loss_iou = torch.zeros(1, device=pred_dist.device)
-        loss_dfl = torch.zeros(1, device=pred_dist.device)
-        
-        if fg_mask.sum():
-            # Convert coordinates to xywh format
-            pred_xywh = xyxy2xywh(pred_bboxes[fg_mask])
-            target_xywh = xyxy2xywh(target_bboxes[fg_mask])
-            
-            # ---- Shape-NWD calculation ----
-            mu_p = pred_xywh[..., :2]
-            mu_t = target_xywh[..., :2]
-            sigma_p = pred_xywh[..., 2:]
-            sigma_t = target_xywh[..., 2:]
-            
-            nwd = self.wasserstein_distance(mu_p, mu_t, sigma_p, sigma_t)
-            shape_penalty = self.shape_aware_penalty(sigma_p, sigma_t)
-            loss_nwd = nwd + shape_penalty
-            
-            # ---- Dynamic WIoU calculation ----
-            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], 
-                          CIoU=True)
-            loss_wiou = self.dynamic_wiou(iou)
-            
-            # Loss combination (dynamic weighting)
-            current_ratio = 1 - epoch_ratio  # Adjust with training progress
-            loss_iou = (0.7 * current_ratio * loss_nwd.mean() + 
-                       0.3 * (1 + epoch_ratio) * loss_wiou.mean())
-            
-            # DFL loss calculation
-            if self.use_dfl and self.dfl_loss:
-                target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max-1)
-                loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.reg_max), 
-                                        target_ltrb[fg_mask]).mean()
-
-        return loss_iou, loss_dfl  # Maintain original scaling factor
-
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.reg_max), target_ltrb[fg_mask])
+            loss_dfl = (loss_dfl.squeeze(-1) * weights).sum() / target_scores_sum
+        else:
+            loss_dfl = zero
+        return loss_box, loss_dfl
 
 
 class RotatedBboxLoss(BboxLoss):
@@ -290,18 +173,26 @@ class v8DetectionLoss:
 
         m = model.model[-1]  # Detect() module
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.has_anomaly_objectness = bool(getattr(m, "has_anomaly_objectness", False))
+        self.aa_batches_seen = 0
+        self.last_assigner_stats = None
         self.hyp = h
         self.stride = m.stride  # model strides
+        self.score_level_balance = tuple(getattr(m, "anomaly_level_balance", ()))
+        if self.score_level_balance and len(self.score_level_balance) != len(self.stride):
+            raise ValueError(
+                f"Expected one AA score balance per detection level, got {self.score_level_balance} "
+                f"for {len(self.stride)} levels"
+            )
         self.nc = m.nc  # number of classes
-        self.no = m.nc + m.reg_max * 4
+        self.no = m.nc + m.reg_max * 4 + int(self.has_anomaly_objectness)
         self.reg_max = m.reg_max
         self.device = device
 
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
-        # self.bbox_loss = BboxLoss(m.reg_max).to(device)
-        self.bbox_loss = BboxLoss(m.reg_max, ratio_power=0.6).to(device)  # 设置形状敏感系数
+        self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets, batch_size, scale_tensor):
@@ -331,12 +222,18 @@ class v8DetectionLoss:
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def __call__(self, preds, batch):
-        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        """Calculate box, class, optional AA-objectness and DFL losses."""
+        loss = torch.zeros(4 if self.has_anomaly_objectness else 3, device=self.device)
         feats = preds[1] if isinstance(preds, tuple) else preds
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
-        )
+        concatenated = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2)
+        if self.has_anomaly_objectness:
+            pred_distri, pred_scores, pred_aa_objectness = concatenated.split(
+                (self.reg_max * 4, self.nc, 1), 1
+            )
+            pred_aa_objectness = pred_aa_objectness.permute(0, 2, 1).contiguous()
+        else:
+            pred_distri, pred_scores = concatenated.split((self.reg_max * 4, self.nc), 1)
+            pred_aa_objectness = None
 
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
@@ -358,7 +255,7 @@ class v8DetectionLoss:
         # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
 
         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
-            # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
+            # Direction 1: keep TAL stable by assigning from the pretrained class branch only.
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
             anchor_points * stride_tensor,
@@ -369,25 +266,54 @@ class v8DetectionLoss:
 
         target_scores_sum = max(target_scores.sum(), 1)
 
+        if self.has_anomaly_objectness:
+            self.aa_batches_seen += 1
+            self.last_assigner_stats = {
+                "batch": self.aa_batches_seen,
+                "foreground": int(fg_mask.sum().item()),
+                "ground_truth": int(mask_gt.sum().item()),
+                "class_probability_min": float(pred_scores.detach().sigmoid().min().item()),
+                "class_probability_max": float(pred_scores.detach().sigmoid().max().item()),
+                "aa_objectness_min": float(pred_aa_objectness.detach().min().item()),
+                "aa_objectness_max": float(pred_aa_objectness.detach().max().item()),
+                "target_score_sum": float(target_scores.detach().sum().item()),
+            }
+            if self.aa_batches_seen <= 10 and self.last_assigner_stats["ground_truth"]:
+                LOGGER.info(f"AA-YOLO TAL startup: {self.last_assigner_stats}")
+                if not self.last_assigner_stats["foreground"] or self.last_assigner_stats["target_score_sum"] <= 0:
+                    LOGGER.warning("AA-YOLO Task-Aligned Assigner produced no effective positive targets")
+
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
+        if self.has_anomaly_objectness:
+            score_error = F.mse_loss(pred_aa_objectness.float(), target_scores.float(), reduction="none")
+            if self.score_level_balance:
+                # Preserve YOLOv12's global target-score normalization while reproducing
+                # AA-YOLO's relative P3/P4/P5 emphasis (4.0, 1.0, 0.4).
+                level_weights = torch.cat(
+                    [
+                        score_error.new_full((feat.shape[2] * feat.shape[3], 1), weight)
+                        for feat, weight in zip(feats, self.score_level_balance)
+                    ],
+                    dim=0,
+                ).unsqueeze(0)
+                score_error = score_error * level_weights
+            loss[2] = score_error.sum() / target_scores_sum
 
         # Bbox loss
-        current_epoch = batch.get('epoch', 0)
-        total_epochs = self.hyp.get('epochs', 50)
-        epoch_ratio = current_epoch / total_epochs
-        if fg_mask.sum():
-            target_bboxes /= stride_tensor
-            loss[0], loss[2] = self.bbox_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask , epoch_ratio  # 传递训练进度参数
-            )
+        target_bboxes /= stride_tensor
+        loss[0], loss[-1] = self.bbox_loss(
+            pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
+        )
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
-        loss[2] *= self.hyp.dfl  # dfl gain
+        if self.has_anomaly_objectness:
+            loss[2] *= self.hyp.aa  # AA objectness gain
+        loss[-1] *= self.hyp.dfl  # dfl gain
 
-        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+        return loss.sum() * batch_size, loss.detach()
 
 
 class v8SegmentationLoss(v8DetectionLoss):

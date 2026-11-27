@@ -19,10 +19,11 @@ class DetectionPredictor(BasePredictor):
 
     def postprocess(self, preds, img, orig_imgs, **kwargs):
         """Post-processes predictions and returns a list of Results objects."""
+        iou = kwargs.pop("iou", self.args.iou)
         preds = ops.non_max_suppression(
             preds,
             self.args.conf,
-            self.args.iou,
+            iou,
             self.args.classes,
             self.args.agnostic_nms,
             max_det=self.args.max_det,

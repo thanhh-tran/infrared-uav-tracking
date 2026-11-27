@@ -1,0 +1,17 @@
+# Minimal runtime for the vendored Ultralytics 8.3.88 code.
+# Install PyTorch separately for the CUDA version available on the training machine.
+numpy>=1.24,<2.1
+opencv-python-headless>=4.8,<5
+scipy>=1.10,<2
+PyYAML>=6.0
+pillow>=9.5
+matplotlib>=3.7
+seaborn>=0.13
+pandas>=2.0
+requests>=2.31
+tqdm>=4.66
+psutil>=5.9
+py-cpuinfo>=9.0
+ultralytics-thop>=2.0.14
+gdown>=5.2
+wandb>=0.19,<0.20

@@ -15,7 +15,85 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
+__all__ = "Detect", "AnomalyDetect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
+
+
+class LogUpperIncompleteGamma(torch.autograd.Function):
+    """Stable log upper incomplete gamma copied mathematically from the official AA-YOLO implementation."""
+
+    @staticmethod
+    def forward(ctx, x, order):
+        survival = torch.special.gammaincc(order, x)
+        value = torch.log(survival)
+        fallback = -x + (order - 1) * torch.log(x.clamp_min(torch.finfo(x.dtype).tiny)) - torch.special.gammaln(order)
+        value = torch.where(torch.isfinite(value), value, fallback)
+        ctx.save_for_backward(x, order)
+        return value
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, order = ctx.saved_tensors
+        survival = torch.special.gammaincc(order, x)
+        derivative = -(x.pow(order - 1) * torch.exp(-x)) / survival
+        fallback = (order - 1) / x.clamp_min(torch.finfo(x.dtype).tiny) - 1
+        derivative = torch.where(torch.isfinite(derivative), derivative, fallback)
+        return grad_output * derivative, None
+
+
+class AnomalyTesting(nn.Module):
+    """AA-YOLO exponential-background/Erlang statistical test with per-scale EMA state."""
+
+    def __init__(self, channels=8, alpha=0.001, momentum=0.9, inference_ema_weight=0.07, eps=1e-7):
+        super().__init__()
+        self.channels = channels
+        self.alpha = alpha
+        self.momentum = momentum
+        self.inference_ema_weight = inference_ema_weight
+        self.eps = eps
+        self.register_buffer("mean_ema", torch.ones(1, 1, 1, 1))
+        self.register_buffer("ema_initialized", torch.tensor(False))
+
+    def reset_running_statistics(self):
+        """Discard statistics collected by YOLO's synthetic stride-probing forward pass."""
+        self.mean_ema.fill_(1.0)
+        self.ema_initialized.fill_(False)
+
+    def forward(self, x):
+        input_dtype = x.dtype
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            values = x.float()
+            batch_mean = values.mean(dim=(1, 2, 3), keepdim=True)
+            mean = batch_mean.mean(dim=0, keepdim=True).detach()
+            if self.training:
+                if not bool(self.ema_initialized):
+                    self.mean_ema.copy_(mean)
+                    self.ema_initialized.fill_(True)
+                else:
+                    self.mean_ema.mul_(self.momentum).add_(mean, alpha=1.0 - self.momentum)
+                rate = 1.0 / (batch_mean + self.eps)
+            else:
+                current_rate = 1.0 / (batch_mean + self.eps)
+                ema_rate = 1.0 / (self.mean_ema + self.eps)
+                rate = self.inference_ema_weight * ema_rate + (1.0 - self.inference_ema_weight) * current_rate
+            statistic = (rate * values).sum(dim=1, keepdim=True)
+            order = torch.tensor(float(self.channels), device=x.device, dtype=torch.float32)
+            significance = -LogUpperIncompleteGamma.apply(statistic, order)
+            confidence = 2.0 * torch.sigmoid(self.alpha * significance) - 1.0
+        return confidence.clamp_(0.0, 1.0).to(input_dtype)
+
+
+class AnomalyFilter(nn.Sequential):
+    """Official AA-YOLO two Conv-BN-ReLU filtering layers."""
+
+    def __init__(self, in_channels, out_channels=8):
+        super().__init__(
+            nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=True),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=True),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=False),
+        )
 
 
 class Detect(nn.Module):
@@ -124,11 +202,13 @@ class Detect(nn.Module):
             dbox = self.decode_bboxes(
                 self.dfl(box) * self.strides, self.anchors.unsqueeze(0) * self.strides, xywh=False
             )
-            return dbox.transpose(1, 2), cls.sigmoid().permute(0, 2, 1)
+            scores = cls if getattr(self, "scores_are_probabilities", False) else cls.sigmoid()
+            return dbox.transpose(1, 2), scores.permute(0, 2, 1)
         else:
             dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
 
-        return torch.cat((dbox, cls.sigmoid()), 1)
+        scores = cls if getattr(self, "scores_are_probabilities", False) else cls.sigmoid()
+        return torch.cat((dbox, scores), 1)
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
@@ -170,6 +250,57 @@ class Detect(nn.Module):
         scores, index = scores.flatten(1).topk(min(max_det, anchors))
         i = torch.arange(batch_size)[..., None]  # batch indices
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
+
+
+class AnomalyDetect(Detect):
+    """YOLOv12 head with a pretrained class branch and a parallel AA objectness branch."""
+
+    has_anomaly_objectness = True
+    scores_are_probabilities = True
+    # AA-YOLO's scale-wise objectness loss balance for P3, P4 and P5.
+    anomaly_level_balance = (4.0, 1.0, 0.4)
+
+    def __init__(self, nc=1, anomaly_channels=8, anomaly_alpha=0.001, ch=()):
+        if nc != 1:
+            raise ValueError(f"AnomalyDetect currently supports the one-class UAV task only, got nc={nc}")
+        super().__init__(nc=nc, ch=ch)
+        self.aa_filters = nn.ModuleList(AnomalyFilter(x, anomaly_channels) for x in ch)
+        self.anomaly_tests = nn.ModuleList(
+            AnomalyTesting(channels=anomaly_channels, alpha=anomaly_alpha) for _ in ch
+        )
+        self.last_anomaly_maps = None
+
+    def forward(self, x):
+        outputs, maps = [], []
+        for i in range(self.nl):
+            aa_objectness = self.anomaly_tests[i](self.aa_filters[i](x[i]))
+            maps.append(aa_objectness)
+            outputs.append(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i]), aa_objectness), 1))
+        if self.training:
+            self.last_anomaly_maps = None
+            return outputs
+        self.last_anomaly_maps = [item.detach() for item in maps]
+        detector_outputs = []
+        for output in outputs:
+            box, class_logits, aa_objectness = output.split((self.reg_max * 4, self.nc, 1), 1)
+            score_mode = getattr(self, "inference_score_mode", "product")
+            if score_mode == "product":
+                scores = class_logits.sigmoid() * aa_objectness
+            elif score_mode == "aa_only":
+                scores = aa_objectness
+            else:
+                raise ValueError(f"Unsupported AA inference_score_mode={score_mode!r}")
+            detector_outputs.append(torch.cat((box, scores), 1))
+        y = self._inference(detector_outputs)
+        return y if self.export else (y, outputs)
+
+    def bias_init(self):
+        """Initialize the standard box/class branches; AA objectness has no output bias."""
+        super().bias_init()
+
+    def reset_anomaly_statistics(self):
+        for module in self.anomaly_tests:
+            module.reset_running_statistics()
 
 
 class Segment(Detect):
